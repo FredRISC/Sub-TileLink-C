@@ -1,0 +1,95 @@
+You are an expert SystemVerilog CPU/Interconnect Architect. I am starting a new, independent RTL project to build a Simplified TileLink-C (TL-C) interconnect.
+
+Ultimately, this interconnect will act as the bridge between an Out-of-Order VIPT L1 Cache (which has MSHRs and a Coalescing Store Buffer) and an unimplmented L2 Cache/Memory controller (just some ports to the L1 cache).
+
+Project Scope & Constraints:
+
+    Subset: We are implementing a functional subset of TL-C focusing only on N-to-T (Invalid to Trunk) state transitions to support write-back caching. We are skipping the 'Shared' state entirely to avoid full MOESI complexity.
+
+    Channels: All 5 independent channels (A, B, C, D, E) must be implemented with standard decoupled valid/ready handshakes.
+
+    Supported Opcodes:
+
+        Channel A: AcquireBlock (for cache misses).
+
+        Channel B: ProbeBlock (for cache recalls/invalidations from L2).
+
+        Channel C: ProbeAckData and ReleaseData (for write-backs and dirty evictions).
+
+        Channel D: GrantData and ReleaseAck.
+
+        Channel E: GrantAck (to finalize the 3-hop transaction).
+
+    Deadlock Avoidance: The L1 (Client) node must stall/block any new Channel A requests if there is a pending Channel B Probe.
+
+    Data: Data width is 512 bits (64-byte cache line). Address width is 32 bits.
+
+Initial Task:
+
+    Tell me what's TileLink from scratch first, and treat me as a ECE grad student with knowledge in Computer Architecture. My goal is to build this (as a counterpart of common AXI4) and demonstrate on my resume.
+    Teach me strategically and tell me what to do and I'll try first (like coding).
+
+    The following is what I got from AI (so I don't know what they are about, but we'll get to them; you decide when to do these):
+        We will generate a comprehensive tl_c_interface.sv file using a SystemVerilog interface. It must contain all 5 channels with appropriate payload fields (opcode, param, size, source, sink, address, data, etc.) parameterized for modularity. Include modport definitions for both client (L1) and manager (L2).
+
+        We will generate a tl_c_pkg.sv package containing typedef enums for the specific opcodes and params mentioned above.
+
+        Later provide a brief explanation of the handshaking sequence for an AcquireBlock -> GrantData -> GrantAck transaction using your generated interface.
+
+
+Personal Note:
+    
+    In TileLink, an L1 Cache (the Client) never talks directly to another L1 Cache. It only talks to the L2 Cache (the Manager). The L2 acts as the central directory.
+    If Core 0 wants a cache line, it asks the L2.
+    If the L2 knows Core 1 has modified that line, the L2 sends a "Probe" (Channel B) to Core 1.
+    Core 1 writes the data back to the L2 (Channel C).
+    The L2 then grants the data to Core 0 (Channel D).
+
+    None (N): You have no permissions. This is the Invalid (I) state.
+    Branch (B): You have read-only permissions. This is the Shared (S) state.
+    Trunk (T): You have read/write ownership. This maps to the Modified (M) or Exclusive (E) state.
+
+    How we will use the interface:
+        "
+        // 1. The L1 Module definition uses the interface with a modport
+            module l1_cache_controller (
+                input logic clk,
+                input logic rst_n,
+                // Connect to the TileLink interface using the client modport
+                tl_c_interface.client tl_bus 
+            );
+                // Inside the module, you access the signals using the dot operator:
+                always_ff @(posedge clk) begin
+                    if (tl_bus.a_ready && tl_bus.a_valid) begin
+                        // Transaction accepted!
+                    end
+                end
+            endmodule
+            
+        // 2. In the top-level Testbench or SoC wrapper:  
+            module soc_top;
+                // 1. Instantiate the physical wires
+                    tl_c_interface #(
+                        .ADDR_WIDTH(32),
+                        .DATA_WIDTH(512),
+                        .SOURCE_WIDTH(4), // For 16 L1 MSHRs
+                        .SINK_WIDTH(4)    // For 16 L2 Trackers
+                    ) tl_bus ();
+
+                    // 2. Instantiate L1 and connect the 'client' modport
+                    L1Cache l1_inst (
+                        .clk(clk),
+                        .rst_n(rst_n),
+                        // ... other core signals ...
+                        .tl_bus(tl_bus.client) 
+                    );
+
+                    // 3. Instantiate L2 and connect the 'manager' modport
+                    L2Cache l2_inst (
+                        .clk(clk),
+                        .rst_n(rst_n),
+                        .tl_bus(tl_bus.manager)
+                    );
+                endmodule
+
+        "
