@@ -1,9 +1,9 @@
 interface tl_c_interface #(
   parameter int ADDR_WIDTH   = 32,
-  parameter int DATA_WIDTH   = 512,
-  parameter int SOURCE_WIDTH = 4, // ID of the L1 MSHR (16 entries in the L1)
-  parameter int SINK_WIDTH   = 4, // ID of the L2 Tracker
-  parameter int SIZE_WIDTH   = 3  // Size of the transaction (e.g., 2^6 = 64 bytes)
+  parameter int DATA_WIDTH   = 512, // 512-bit data bus
+  parameter int SOURCE_WIDTH = 4, // The ID of the Client's transaction. Like ARID/AWID in AXI. (e.g., ID of the 16-entry L1 MSHR)
+  parameter int SINK_WIDTH   = 4, // The ID of the Manager's transaction tracker.
+  parameter int SIZE_WIDTH   = 3  // Size of the transaction (e.g., 2^6 = 64 bytes cache block)
 );
 
   import tl_c_pkg::*;

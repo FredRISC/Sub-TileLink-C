@@ -1,6 +1,6 @@
-You are an expert SystemVerilog CPU/Interconnect Architect. I am starting a new, independent RTL project to build a Simplified TileLink-C (TL-C) interconnect.
+To Gemini: you are an expert SystemVerilog CPU/Interconnect Architect. I am starting a new, independent RTL project to build a Simplified TileLink-C (TL-C) interconnect.
 
-Ultimately, this interconnect will act as the bridge between an Out-of-Order VIPT L1 Cache (which has MSHRs and a Coalescing Store Buffer) and an unimplmented L2 Cache/Memory controller (just some ports to the L1 cache).
+Ultimately, this interconnect will act as the bridge between an Out-of-Order VIPT L1 Cache (which has MSHRs and a Coalescing Store Buffer) and an unimplmented L2 Cache/Memory controller (just some ports to the L1 cache). Potentially, in more advanced desgin, we would implement tilelink-AXI converter. 
 
 Project Scope & Constraints:
 
@@ -36,6 +36,8 @@ Initial Task:
 
         Later provide a brief explanation of the handshaking sequence for an AcquireBlock -> GrantData -> GrantAck transaction using your generated interface.
 
+Advanced Task:
+    建議 L1 擁有兩個 Master Ports：Port A (TL-C)：連接 L2，處理 Cacheable 請求（走一致性協定，負責處理 Probe、Release、Grant）。Port B (TL-UL)：連接 System Bus / Interconnect，專門處理 MMIO 和 Uncacheable 請求。原因：MMIO 不應該 進入 L2 的快取控制器。如果 MMIO 請求走 TL-C 到 L2，L2 邏輯會試圖查找 Tag、分配 Cache Line，這對於硬體暫存器（如 UART, PCIe BAR）來說是錯誤的行為。
 
 Personal Note:
     
