@@ -158,7 +158,7 @@ logic MSHR_hit; // find a MSHR waiting for the same cache line
 logic [$clog2(`MSHR_SIZE)-1:0] MSHR_hit_ID;
 logic [$clog2(`MSHR_SIZE)-1:0] MSHR_alloc_ID; // the allocated MSHR ID
 logic MSHR_AVAILABLE; // no MSHR available
-logic TARGET_LIST_AVAIABLE;
+logic TARGET_LIST_AVAILABLE;
 assign TARGET_LIST_AVAILABLE = MSHR_inst[MSHR_hit_ID].target_list_ptr < `TARGET_LIST_SIZE;
 
 
@@ -171,26 +171,37 @@ assign L2_return_index = MSHR_inst[tl_bus.d_source].block_id[`INDEX_BITS-1:0];
 // Eviction logic
 logic [$clog2(`NUM_OF_WAYS)-1:0] Eviction_Target_Way;       // PLRU core output - Target way to be evicted
 logic [`PLRU_BITS_SIZE-1:0] PLRU_bits[`NUM_OF_SETS-1:0];    // PLRU logic
-logic Cache_hit;                                            // PLRU logic
-logic [$clog2(`NUM_OF_WAYS)-1:0] Cache_hit_Way;             // PLRU logic
-logic [`INDEX_BITS-1:0] hit_index;                          // Latches the index to match the 1-cycle delay of Cache_hit
+logic Cache_hit_PLRU_flag;                                            // PLRU logic
+logic [$clog2(`NUM_OF_WAYS)-1:0] Cache_hit_Way_PLRU_flag;             // PLRU logic
+logic [`INDEX_BITS-1:0] hit_index;                          // Latches the index to match the 1-cycle delay of Cache_hit_PLRU_flag
 
-logic WRITEBACK_REQUIRED;                           // The target evicted block is dirty and required to be writen back
 logic [`XLEN-1:0] evicted_block_physical_address;   // Physical address to L2 (L2 is PIPT)
 logic [`CacheLineSize-1:0][7:0] evicted_block_data; // The cache block data to be written back to L2
 
-assign WRITEBACK_REQUIRED = (L1Cache_inst[L2_return_index][Eviction_Target_Way].valid && L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty)
 assign evicted_block_physical_address = ALIASING? {26'h0 , 6'h0}:{L1Cache_inst[L2_return_index][Eviction_Target_Way].tag, L2_return_index, 6'h0}; // ignore Aliasing case now
-assign evicted_block_data = L1Cache_inst[L2_return_index][Eviction_Target_Way].data;
-
-logic [`XLEN-1:0] evicted_block_physical_address_passthrough;
-logic [`CacheLineSize-1:0][7:0] evicted_block_data_passthrough; 
+assign evicted_block_data = L1Cache_inst[L2_return_index][Eviction_Target_Way].data; 
 
 logic Return_Block_Hit;
 
 // Store Buffer Signals
 logic Store_Buffer_ID_Alloc;
 assign Store_Buffer_ID_Alloc = MSHR_alloc_ID;
+
+logic Cache_hit;                                       
+logic [$clog2(`NUM_OF_WAYS)-1:0] Cache_hit_Way;   
+
+always_comb begin : Cache_hit_Check
+    Cache_hit = 0;
+    Cache_hit_Way = '0;
+    for(int i=0;i<`NUM_OF_WAYS;i=i+1) begin 
+        // Search if the requested address is in the Cache 
+        if(L1Cache_inst[extracted_index_passthrough][i].valid && L1Cache_inst[extracted_index_passthrough][i].tag == extracted_tag) begin
+            Cache_hit = 1'b1;
+            Cache_hit_Way = i;
+            break;
+        end
+    end
+end
 
 // Cache Logic FSM
 typedef enum logic[2:0] {
@@ -203,14 +214,9 @@ typedef enum logic[2:0] {
 
 FSM_state_t [2:0] state;
 FSM_state_t [2:0] next_state;
-logic d_handshake; // Note that handshake here doesn't mean d_valid == d_ready
-logic c_handshake; // Note that handshake here doesn't mean c_valid == c_ready
-assign d_handshake = Block_Return_state == WAIT_BLOCK_RETURN_D && tl_bus.d_valid;  
-assign c_handshake = Block_Return_state == WAIT_WRITEBACK_C && tl_bus.c_ready;
 
 always_comb begin : FSM_next_state
     L1_ready_out   = 1'b0;
-    tl_bus.d_ready = 1'b0;
     next_state     = state;
 
     case(state)
@@ -233,15 +239,20 @@ always_comb begin : FSM_next_state
                 else begin
                     if(req_type_passthrough == 0) begin
                         // MSHR Found or MSHR Allocated -> return to IDLE state to assert ready for new request
-                        if(Cache_Hit || MSHR_HIT && TARGET_LIST_AVAILABLE || (!MSHR_HIT && MSHR_AVAILABLE)) begin 
+                        if(Cache_hit || (MSHR_hit && TARGET_LIST_AVAILABLE) || (!MSHR_hit && MSHR_AVAILABLE)) begin 
                             next_state = IDLE;
+                        end
+                        else if(d_handshake && !MSHR_AVAILABLE && !(MSHR_hit && !TARGET_LIST_AVAILABLE)) begin
+                            // if no MSHR is available at the moment but a block is getting returned, we move to SETTLE_REQ to try again next cycle 
+                            // excluding the case when MSHR hit but target list is currently unavailable
+                            next_state = SETTLE_REQ;
                         end
                         else begin
                             next_state = WAIT_BLOCK;
                         end
                     end
                     else begin
-                        if(Cache_Hit || MSHR_HIT || (!MSHR_HIT && MSHR_AVAILABLE)) begin
+                        if(Cache_hit_PLRU_flag || MSHR_hit || (!MSHR_hit && MSHR_AVAILABLE)) begin
                             next_state = IDLE;
                         end
                         else begin
@@ -253,9 +264,7 @@ always_comb begin : FSM_next_state
         end
 
         WAIT_BLOCK: begin
-            tl_bus.d_ready = 1'b1;
             if(d_handshake) begin
-                tl_bus.d_ready = 1'b0;
                 if(req_type_passthrough == 0 && MSHR_inst[tl_bus.d_source].block_id == extracted_block_id_passthrough) begin
                     next_state = IDLE;
                 end
@@ -303,8 +312,8 @@ always_ff @(posedge clk or negedge rst_n) begin : FSM_state_update
                 lsq_tag_passthrough  <= lsq_tag_in;
             end
             else begin
-                req_type_passthrough <= 1'b1; // keep req type throughout the entire request FSM lifecycle
-                store_data_passthrough <= store_data_in;
+                req_type_passthrough      <= 1'b1; // keep req type throughout the entire request FSM lifecycle
+                store_data_passthrough    <= store_data_in;
                 store_byte_en_passthrough <= store_byte_en_in;
             end
         end
@@ -316,66 +325,53 @@ always_ff @(posedge clk or negedge rst_n) begin : FSM_state_update
     end
 end
 
-// Cache Block Return Logic FSM
-typedef enum logic {
-    WAIT_BLOCK_RETURN_D,
-    WAIT_WRITEBACK_C
-} FSM_Block_Return_state_t;
+// Decoupled Outbound Buffers for Channels C & E
+logic wb_buffer_valid;
+logic [`XLEN-1:0] wb_buffer_addr;
+logic [`CacheLineSize-1:0][7:0] wb_buffer_data;
 
-FSM_Block_Return_state_t [1:0] Block_Return_state;
-FSM_Block_Return_state_t [1:0] Block_Return_next_state;
-logic WAIT_READY_E; // flag to indicate waiting for Master e_ready signal after receiving returned block
-logic [SINK_WIDTH-1:0] d_sink_passthrough;
+logic ack_buffer_valid;
+logic [SINK_WIDTH-1:0] ack_buffer_sink;
 
-always_comb begin: FSM_Block_Return_next_state
-    Block_Return_next_state = Block_Return_state;
-    tl_bus.d_ready = 1'b1;
-    case(Block_Return_state)
-        WAIT_BLOCK_RETURN_D: begin // Assume d_valid depends on d_ready
-            if(tl_bus.d_valid && (WRITEBACK_REQUIRED && !tl_bus.c_ready)) begin
-                tl_bus.d_ready = 1'b0;
-                Block_Return_next_state = WAIT_WRITEBACK_C; // Wait for channel C ready signal to write back 
-            end
-        end
-        WAIT_WRITEBACK_C: begin
-            tl_bus.d_ready = 1'b0;
-            if(tl_bus.c_ready) begin
-                Block_Return_next_state = WAIT_BLOCK_RETURN_D; // Go back to wait block return
-            end
-        end
-        default: begin
-            Block_Return_next_state = Block_Return_state;
-        end
-    endcase
-end
-always_ff @(posedge clk or negedge rst_n) begin : FSM_Block_Return_state_update
+logic WRITEBACK_REQUIRED; // The target evicted block is dirty and required to be writen back
+assign WRITEBACK_REQUIRED = (L1Cache_inst[L2_return_index][Eviction_Target_Way].valid && L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty);
+
+// Channel D is only ready to accept data if our outbound C/E buffers are empty
+// effectively creating a FSM with WAIT_BLOCK_RETURN (IDLE_D) -> BLOCK_RETURNED (ACK_E + EVICT_C)
+assign tl_bus.d_ready = (!wb_buffer_valid && !ack_buffer_valid); 
+assign d_handshake    = tl_bus.d_valid && tl_bus.d_ready;
+
+always_ff @(posedge clk or negedge rst_n) begin : OUTBOUND_BUFFERS
     if(!rst_n || flush) begin
-        Block_Return_state <= WAIT_BLOCK_RETURN_D;
-        WAIT_READY_E       <= 1'b0;
-    end
-    else begin
-        Block_Return_state <= Block_Return_next_state;
-        tl_bus.e_valid <= 1'b0;
-        if(d_handshake) begin // Change to WAIT_WRITEBACK_C state on posedge
-            if(tl_bus.e_ready) begin
-                tl_bus.e_valid <= 1'b1;
-                tl_bus.e_sink  <= tl_bus.d_sink;
-            end
-            else begin
-                d_sink_passthrough <= tl_bus.d_sink;
-                WAIT_READY_E   <= 1'b1;
-            end
-        end
-
-        if(WAIT_READY_E) begin
-            if(tl_bus.e_ready) begin
-                tl_bus.e_valid <= 1'b1;
-                tl_bus.e_sink  <= d_sink_passthrough;
-                WAIT_READY_E   <= 1'b0;
+        wb_buffer_valid  <= 1'b0;
+        ack_buffer_valid <= 1'b0;
+    end else begin
+        if(tl_bus.c_valid && tl_bus.c_ready) wb_buffer_valid  <= 1'b0;
+        if(tl_bus.e_valid && tl_bus.e_ready) ack_buffer_valid <= 1'b0;
+        
+        if(d_handshake) begin // on block return handshake (d-channel), we can assert e-channel valid signal
+            ack_buffer_valid <= 1'b1;
+            ack_buffer_sink  <= tl_bus.d_sink;
+            if(WRITEBACK_REQUIRED) begin
+                wb_buffer_valid <= 1'b1;
+                wb_buffer_addr  <= evicted_block_physical_address;
+                wb_buffer_data  <= evicted_block_data;
             end
         end
     end
 end
+
+// Combinational driving of Channels C and E
+assign tl_bus.c_valid   = wb_buffer_valid;
+assign tl_bus.c_address = wb_buffer_addr;
+assign tl_bus.c_data    = wb_buffer_data;
+assign tl_bus.c_size    = 3'h6;
+assign tl_bus.c_opcode  = ReleaseData;
+assign tl_bus.c_param   = tl_param_e.T_TO_N;
+assign tl_bus.c_source  = '0; // Release is voluntary, source ID can be safely hardcoded to 0
+
+assign tl_bus.e_valid = ack_buffer_valid;
+assign tl_bus.e_sink  = ack_buffer_sink;
 
 
 // Cache logic (load, store, miss)
@@ -385,7 +381,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
         load_data_valid_out      <= 1'b0;
         tl_bus.a_valid           <= 1'b0;
         lsq_wakeup_vector_out    <= '0;
-        MSHR_Issue_Queue_head <= 'd0;
+        MSHR_Issue_Queue_head    <= 'd0;
 
         for(int i=0;i<`NUM_OF_SETS;i=i+1) begin
             for(int j=0;j<`NUM_OF_WAYS;j=j+1) begin
@@ -398,14 +394,14 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
         for(int i=0;i<`STORE_BUFFER_SIZE;i=i+1) begin
             Store_Buffer_inst[i] <= '{default: '0};
         end
-        Cache_hit           <= 1'b0;
-        Cache_hit_Way       <= '0;
+        Cache_hit_PLRU_flag           <= 1'b0;
+        Cache_hit_Way_PLRU_flag       <= '0;
         hit_index           <= '0;
         Return_Block_Hit    <= 1'b0;
 
     end
     else begin
-        Cache_hit                <= 1'b0;
+        Cache_hit_PLRU_flag      <= 1'b0;
         lsq_wakeup_vector_out    <= '0; // Default to 0 to create 1-cycle pulses
         tl_bus.a_valid           <= 1'b0; // Default to 0 to create 1-cycle pulses
         load_data_valid_out      <= 1'b0;
@@ -414,25 +410,22 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
         case(state) // On req_in, use virtual_index to get the set and wait for (at least) one cycle for the physical tag from the TLB.
             WAIT_TLB: begin
                 if(physical_tag_valid_in) begin
-                    if(d_handshake && MSHR_inst[tl_bus.d_source].block_id == extracted_block_id) begin
+                    if(d_handshake && MSHR_inst[tl_bus.d_source].block_id == extracted_block_id) begin // Check if Channel D is returning the requested block
                         // next_state is SETTLE_REQ
                         Return_Block_Hit <= 1'b1;
                     end
-                    else begin // Check if Channel D is returning the brequested lock
+                    else begin 
                         if(req_type_passthrough == 0) begin
                             if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the cache line
-                                for(int i=0;i<`NUM_OF_WAYS;i=i+1) begin 
-                                    // Search if the requested address is in the Cache 
-                                    if(L1Cache_inst[extracted_index_passthrough][i].valid && L1Cache_inst[extracted_index_passthrough][i].tag == extracted_tag) begin
-                                        load_data_out       <= L1Cache_inst[extracted_index_passthrough][i].data;
-                                        load_data_valid_out <= 1'b1;
-                                        Cache_hit           <= 1'b1; // Cache hit in the set
-                                        Cache_hit_Way       <= i;
-                                        hit_index           <= extracted_index_passthrough; // Latch index for delayed PLRU update
-                                        break;
-                                    end
+                                if(Cache_hit) begin
+                                    load_data_out       <= L1Cache_inst[extracted_index_passthrough][Cache_hit_Way].data;
+                                    load_data_valid_out <= 1'b1;
+                                    Cache_hit_PLRU_flag           <= 1'b1; // Cache hit in the set
+                                    Cache_hit_Way_PLRU_flag       <= Cache_hit_Way;
+                                    hit_index           <= extracted_index_passthrough; // Latch index for delayed PLRU update
+                                    break;                  
                                 end
-                                if(i == (`NUM_OF_WAYS-1)) begin // Cache line was not found in the set, we need to allocate a MSHR
+                                else begin // Cache line was not found in the set, we need to allocate a MSHR
                                     if (MSHR_AVAILABLE) begin
                                         MSHR_inst[MSHR_alloc_ID].block_id        <= extracted_block_id; // Record the unique block ID for L1  
                                         MSHR_inst[MSHR_alloc_ID].target_list_ptr <= 'd1;
@@ -470,20 +463,18 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                         end
                         else begin // req_type_passthrough == 1 (store request)
                             if(!MSHR_hit) begin // No MSHR is waiting for the tag, check if any way in the set is holding the line
-                                for(int i=0;i<`NUM_OF_WAYS;i=i+1) begin // Cache hit in the set
-                                    if(L1Cache_inst[extracted_index_passthrough][i].valid && L1Cache_inst[extracted_index_passthrough][i].tag == extracted_tag) begin
-                                        if(store_byte_en_passthrough[0]) L1Cache_inst[extracted_index_passthrough][i].data[extracted_offset_passthrough]   <= store_data_passthrough[7:0];
-                                        if(store_byte_en_passthrough[1]) L1Cache_inst[extracted_index_passthrough][i].data[extracted_offset_passthrough+1] <= store_data_passthrough[15:8];
-                                        if(store_byte_en_passthrough[2]) L1Cache_inst[extracted_index_passthrough][i].data[extracted_offset_passthrough+2] <= store_data_passthrough[23:16];
-                                        if(store_byte_en_passthrough[3]) L1Cache_inst[extracted_index_passthrough][i].data[extracted_offset_passthrough+3] <= store_data_passthrough[31:24];
-                                        L1Cache_inst[extracted_index_passthrough][i].dirty <= 1'b1;
-                                        Cache_hit     <= 1'b1;
-                                        Cache_hit_Way <= i;
-                                        hit_index     <= extracted_index_passthrough; // Latch index for delayed PLRU update
-                                        break;
-                                    end
+                                if(Cache_hit) begin
+                                    if(store_byte_en_passthrough[0]) L1Cache_inst[extracted_index_passthrough][Cache_hit_Way].data[extracted_offset_passthrough]   <= store_data_passthrough[7:0];
+                                    if(store_byte_en_passthrough[1]) L1Cache_inst[extracted_index_passthrough][Cache_hit_Way].data[extracted_offset_passthrough+1] <= store_data_passthrough[15:8];
+                                    if(store_byte_en_passthrough[2]) L1Cache_inst[extracted_index_passthrough][Cache_hit_Way].data[extracted_offset_passthrough+2] <= store_data_passthrough[23:16];
+                                    if(store_byte_en_passthrough[3]) L1Cache_inst[extracted_index_passthrough][Cache_hit_Way].data[extracted_offset_passthrough+3] <= store_data_passthrough[31:24];
+                                    L1Cache_inst[extracted_index_passthrough][Cache_hit_Way].dirty <= 1'b1;
+                                    Cache_hit_PLRU_flag     <= 1'b1;
+                                    Cache_hit_Way_PLRU_flag <= Cache_hit_Way;
+                                    hit_index     <= extracted_index_passthrough; // Latch index for delayed PLRU update
+                                    break;
                                 end
-                                if(i == (`NUM_OF_WAYS-1)) begin
+                                else begin
                                     // Cache line not found in the set, need to allocate a MSHR
                                     if (MSHR_AVAILABLE) begin
                                         MSHR_inst[MSHR_alloc_ID].block_id        <= extracted_block_id;
@@ -557,8 +548,8 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                             if(req_type_passthrough == 0) begin  // load request
                                 load_data_out       <= L1Cache_inst[extracted_index_passthrough][i].data;
                                 load_data_valid_out <= 1'b1;
-                                Cache_hit           <= 1'b1; // Cache hit in the set
-                                Cache_hit_Way       <= i;
+                                Cache_hit_PLRU_flag           <= 1'b1; // Cache hit in the set
+                                Cache_hit_Way_PLRU_flag       <= i;
                                 hit_index           <= extracted_index_passthrough; // Latch index for delayed PLRU update
                                 break;
                             end
@@ -568,8 +559,8 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                                 if(store_byte_en_passthrough[2]) L1Cache_inst[extracted_index_passthrough][i].data[extracted_offset_passthrough+2] <= store_data_passthrough[23:16];
                                 if(store_byte_en_passthrough[3]) L1Cache_inst[extracted_index_passthrough][i].data[extracted_offset_passthrough+3] <= store_data_passthrough[31:24];
                                 L1Cache_inst[extracted_index_passthrough][i].dirty <= 1'b1;
-                                Cache_hit     <= 1'b1;
-                                Cache_hit_Way <= i;
+                                Cache_hit_PLRU_flag     <= 1'b1;
+                                Cache_hit_Way_PLRU_flag <= i;
                                 hit_index     <= extracted_index_passthrough; // Latch index for delayed PLRU update
                                 break;
                             end
@@ -587,7 +578,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                         tl_bus.a_valid   <= 1'b1;
                         tl_bus.a_param   <= tl_param_e.N_TO_T;      // Request for permission change from N to T
                         tl_bus.a_opcode  <= tl_a_op_e.AcquireBlock;
-                        tl_bus.a_address <= extracted_physical_address; // Send the physical address since L2 is PIPT
+                        tl_bus.a_address <= extracted_physical_address_passthrough; // Send the physical address since L2 is PIPT
                         tl_bus.a_size    <= 3'h6;                   // 2^6 = 64 bytes cache block size
                         tl_bus.a_source  <= MSHR_alloc_ID;          // MSHR ID for returning the cache block
                     end
@@ -596,7 +587,7 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
                         MSHR_Issue_Queue_inst[MSHR_Issue_Queue_tail].a_source  <= MSHR_alloc_ID;
                         MSHR_Issue_Queue_inst[MSHR_Issue_Queue_tail].a_param   <= tl_param_e.N_TO_T;
                         MSHR_Issue_Queue_inst[MSHR_Issue_Queue_tail].a_opcode  <= tl_a_op_e.AcquireBlock;
-                        MSHR_Issue_Queue_inst[MSHR_Issue_Queue_tail].a_address <= extracted_physical_address;
+                        MSHR_Issue_Queue_inst[MSHR_Issue_Queue_tail].a_address <= extracted_physical_address_passthrough;
                         MSHR_Issue_Queue_inst[MSHR_Issue_Queue_tail].a_size    <= 3'h6;
                         MSHR_Issue_Queue_tail <= (MSHR_Issue_Queue_tail + 1);                                   
                     end                              
@@ -606,59 +597,32 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
         
         // Block Return Handling: Write-Back, Block Filling, MSHR & Store Buffer Retirement 
         if(d_handshake) begin
-                // Dirty Block Eviction 
-                if(WRITEBACK_REQUIRED) begin
-                    if(tl_bus.c_ready) begin
-                        // Channel C is ready: Write back dirty block when c_ready are asserted
-                        tl_bus.c_valid   <= 1'b1;
-                        tl_bus.c_address <= evicted_block_physical_address; // phyiscal address (L2 is PIPT)
-                        tl_bus.c_data    <= evicted_block_data;    
-                        tl_bus.c_size    <= 3'h6;
-                        tl_bus.c_opcode  <= ReleaseData;
-                        tl_bus.c_param   <= tl_param_e.T_TO_N;
-                        // tl_bus.c_source?
-                    end
-                    else begin
-                        // Channel C is not ready: buffer the dirty block so the returned block can be filled in this posedege
-                        // The buffered evicted block waits in the WAIT_WRITEBACK_C state until c_ready is asserted
-                        evicted_block_physical_address_passthrough <= evicted_block_physical_address;
-                        evicted_block_data_passthrough             <= evicted_block_data;
-                    end
-                end
-                // Block Filling
-                L1Cache_inst[L2_return_index][Eviction_Target_Way].tag     <= L2_return_tag;
-                L1Cache_inst[L2_return_index][Eviction_Target_Way].data    <= tl_bus.d_data;
-                L1Cache_inst[L2_return_index][Eviction_Target_Way].valid   <= 1'b1;
-                L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty   <= 1'b0;
-                L1Cache_inst[L2_return_index][Eviction_Target_Way].TL_Perm <= 2'b01; // T Permission (Modified or Exclusive)
+            // Block Filling
+            L1Cache_inst[L2_return_index][Eviction_Target_Way].tag     <= L2_return_tag;
+            L1Cache_inst[L2_return_index][Eviction_Target_Way].data    <= tl_bus.d_data;
+            L1Cache_inst[L2_return_index][Eviction_Target_Way].valid   <= 1'b1;
+            L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty   <= 1'b0;
+            L1Cache_inst[L2_return_index][Eviction_Target_Way].TL_Perm <= 2'b01; // T Permission (Modified or Exclusive)
 
-                // MSHR Retirement
-                for(int i=0;i<`TARGET_LIST_SIZE;i=i+1) begin
-                    // write to wakeup_vector_out to inform lsq of the returned block
-                    lsq_wakeup_vector_out[MSHR_inst[tl_bus.d_source].target_list[i]] <= 1'b1;
-                    if(i == MSHR_inst[tl_bus.d_source].target_list_ptr - 1) break;
-                end
-                MSHR_inst[tl_bus.d_source] <= '{default: '0};
+            // MSHR Retirement
+            for(int i=0;i<`TARGET_LIST_SIZE;i=i+1) begin
+                // write to wakeup_vector_out to inform lsq of the returned block
+                lsq_wakeup_vector_out[MSHR_inst[tl_bus.d_source].target_list[i]] <= 1'b1;
+                if(i == MSHR_inst[tl_bus.d_source].target_list_ptr - 1) break;
+            end
+            MSHR_inst[tl_bus.d_source] <= '{default: '0};
 
-                // Store Buffer Retirement
-                if(Store_Buffer_inst[tl_bus.d_source].busy) begin
-                    L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty <= 1'b1; // Mark dirty since we're storing data to it
-                    for(int i=0; i<`CacheLineSize; i=i+1) begin
-                        // store data to the newly returned block
-                        if(Store_Buffer_inst[tl_bus.d_source].store_byte_en[i]) begin
-                            L1Cache_inst[L2_return_index][Eviction_Target_Way].data[i] <= Store_Buffer_inst[tl_bus.d_source].store_data[i];
-                        end
+            // Store Buffer Retirement
+            if(Store_Buffer_inst[tl_bus.d_source].busy) begin
+                L1Cache_inst[L2_return_index][Eviction_Target_Way].dirty <= 1'b1; // Mark dirty since we're storing data to it
+                for(int i=0; i<`CacheLineSize; i=i+1) begin
+                    // store data to the newly returned block
+                    if(Store_Buffer_inst[tl_bus.d_source].store_byte_en[i]) begin
+                        L1Cache_inst[L2_return_index][Eviction_Target_Way].data[i] <= Store_Buffer_inst[tl_bus.d_source].store_data[i];
                     end
-                    Store_Buffer_inst[tl_bus.d_source] <= '{default: '0};
                 end
-        end
-        else if(c_handshake) begin // Write-Back Handling if not handled on block return because c_ready was not asserted
-            tl_bus.c_valid   <= 1'b1;
-            tl_bus.c_address <= evicted_block_physical_address_passthrough;
-            tl_bus.c_data    <= evicted_block_data_passthrough;    
-            tl_bus.c_size    <= 3'h6;
-            tl_bus.c_opcode  <= ReleaseData;
-            tl_bus.c_param   <= tl_param_e.T_TO_N;
+                Store_Buffer_inst[tl_bus.d_source] <= '{default: '0};
+            end
         end
 
 
@@ -673,9 +637,6 @@ always_ff @(posedge clk or negedge rst_n) begin : CACHE_LOGIC
             tl_bus.a_source   <= MSHR_Issue_Queue_inst[MSHR_Issue_Queue_head].a_source;
             // Advance Head pointer (Assert valid for only one cycle)
             MSHR_Issue_Queue_head <= (MSHR_Issue_Queue_head + 1);
-        end
-        else begin
-            tl_bus.a_valid <= 1'b0;
         end
 
     end
@@ -712,7 +673,7 @@ end
 
 /// Cache Eviction Logic ///
 
-// Path: {cycle 1: TLB Tag Arrival -> Cache Tag Compare (Cache_hit)} -> {cycle 2: PLRU Tree Traversal -> update PLRU SRAM bits} 
+// Path: {cycle 1: TLB Tag Arrival -> Cache Tag Compare (Cache_hit_PLRU_flag)} -> {cycle 2: PLRU Tree Traversal -> update PLRU SRAM bits} 
 // The path coulb be further pipelined
 
 /*
@@ -730,7 +691,7 @@ end
 // Record the tree index to be updated; totally depth=$clog2(NUM_OF_WAYS) nodes to be updated
 logic [$clog2(`PLRU_BITS_SIZE)-1:0] plru_update_idx[$clog2(`NUM_OF_WAYS)-1:0];
 logic [$clog2(`PLRU_BITS_SIZE)-1:0] evict_plru_update_idx[$clog2(`NUM_OF_WAYS)-1:0];
-// plru_update_idx[i+1] = 2*plru_update_idx[i]+2**Cache_hit_Way[$clog2(`NUM_OF_WAYS)-1-i];
+// plru_update_idx[i+1] = 2*plru_update_idx[i]+2**Cache_hit_Way_PLRU_flag[$clog2(`NUM_OF_WAYS)-1-i];
 always_comb begin
     for (int i=0;i<$clog2(`NUM_OF_WAYS);i=i+1) begin
         plru_update_idx[i] = '0;
@@ -738,7 +699,7 @@ always_comb begin
     end
     for(int i=0;i<$clog2(`NUM_OF_WAYS)-1;i++) begin
         // Generic index tracking for Hit Update
-        if(Cache_hit_Way[$clog2(`NUM_OF_WAYS)-1-i]) begin
+        if(Cache_hit_Way_PLRU_flag[$clog2(`NUM_OF_WAYS)-1-i]) begin
             plru_update_idx[i+1] = 2*plru_update_idx[i]+2;
         end
         else begin
@@ -761,10 +722,10 @@ always_ff @(posedge clk or negedge rst_n) begin : UPDATE_PLRU_TREE
         for(int i = 0; i < `NUM_OF_SETS; i = i + 1) PLRU_bits[i] <= '0;
     end else begin
         // Implementation for PLRU eviction logic on Hit
-        if(Cache_hit) begin
+        if(Cache_hit_PLRU_flag) begin
             // Point the tree AWAY from the accessed way
             for(int i=0;i<$clog2(`NUM_OF_WAYS);i=i+1) begin
-                PLRU_bits[hit_index][plru_update_idx[i]] <= ~Cache_hit_Way[$clog2(`NUM_OF_WAYS)-1-i];
+                PLRU_bits[hit_index][plru_update_idx[i]] <= ~Cache_hit_Way_PLRU_flag[$clog2(`NUM_OF_WAYS)-1-i];
             end
         end
 
